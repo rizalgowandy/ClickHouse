@@ -14,10 +14,8 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <IO/Operators.h>
-#include <filesystem>
 #include <base/FnTraits.h>
-
-namespace fs = std::filesystem;
+#include <Disks/IDisk.h>
 
 namespace DB
 {
@@ -30,11 +28,15 @@ namespace ErrorCodes
 
 static std::unordered_map<String, String> fetchTablesCreateQuery(
     const mysqlxx::PoolWithFailover::Entry & connection, const String & database_name,
-    const std::vector<String> & fetch_tables, const Settings & global_settings)
+    const std::vector<String> & fetch_tables, std::unordered_set<String> & materialized_tables_list,
+    const Settings & global_settings)
 {
     std::unordered_map<String, String> tables_create_query;
     for (const auto & fetch_table_name : fetch_tables)
     {
+        if (!materialized_tables_list.empty() && !materialized_tables_list.contains(fetch_table_name))
+            continue;
+
         Block show_create_table_header{
             {std::make_shared<DataTypeString>(), "Table"},
             {std::make_shared<DataTypeString>(), "Create Table"},
@@ -51,7 +53,7 @@ static std::unordered_map<String, String> fetchTablesCreateQuery(
         PullingPipelineExecutor executor(pipeline);
         executor.pull(create_query_block);
         if (!create_query_block || create_query_block.rows() != 1)
-            throw Exception("LOGICAL ERROR mysql show create return more rows.", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "LOGICAL ERROR mysql show create return more rows.");
 
         tables_create_query[fetch_table_name] = create_query_block.getByName("Create Table").column->getDataAt(0).toString();
     }
@@ -103,7 +105,7 @@ void MaterializeMetadata::fetchMasterStatus(mysqlxx::PoolWithFailover::Entry & c
     executor.pull(master_status);
 
     if (!master_status || master_status.rows() != 1)
-        throw Exception("Unable to get master status from MySQL.", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unable to get master status from MySQL.");
 
     data_version = 1;
     binlog_file = (*master_status.getByPosition(0).column)[0].safeGet<String>();
@@ -147,7 +149,8 @@ static bool checkSyncUserPrivImpl(const mysqlxx::PoolWithFailover::Entry & conne
         {std::make_shared<DataTypeString>(), "current_user_grants"}
     };
 
-    String grants_query, sub_privs;
+    String grants_query;
+    String sub_privs;
     StreamSettings mysql_input_stream_settings(global_settings);
     auto input = std::make_unique<MySQLSource>(connection, "SHOW GRANTS FOR CURRENT_USER();", sync_user_privs_header, mysql_input_stream_settings);
     QueryPipeline pipeline(std::move(input));
@@ -161,11 +164,11 @@ static bool checkSyncUserPrivImpl(const mysqlxx::PoolWithFailover::Entry & conne
             grants_query = (*block.getByPosition(0).column)[index].safeGet<String>();
             out << grants_query << "; ";
             sub_privs = grants_query.substr(0, grants_query.find(" ON "));
-            if (sub_privs.find("ALL PRIVILEGES") == std::string::npos)
+            if (!sub_privs.contains("ALL PRIVILEGES"))
             {
-                if ((sub_privs.find("RELOAD") != std::string::npos and
-                    sub_privs.find("REPLICATION SLAVE") != std::string::npos and
-                    sub_privs.find("REPLICATION CLIENT") != std::string::npos))
+                if ((sub_privs.contains("RELOAD") and
+                    sub_privs.contains("REPLICATION SLAVE") and
+                    sub_privs.contains("REPLICATION CLIENT")))
                     return true;
             }
             else
@@ -182,10 +185,9 @@ static void checkSyncUserPriv(const mysqlxx::PoolWithFailover::Entry & connectio
     WriteBufferFromOwnString out;
 
     if (!checkSyncUserPrivImpl(connection, global_settings, out))
-        throw Exception("MySQL SYNC USER ACCESS ERR: mysql sync user needs "
-                        "at least GLOBAL PRIVILEGES:'RELOAD, REPLICATION SLAVE, REPLICATION CLIENT' "
-                        "and SELECT PRIVILEGE on MySQL Database."
-                        "But the SYNC USER grant query is: " + out.str(), ErrorCodes::SYNC_MYSQL_USER_ACCESS_ERROR);
+        throw Exception(ErrorCodes::SYNC_MYSQL_USER_ACCESS_ERROR, "MySQL SYNC USER ACCESS ERR: "
+                        "mysql sync user needs at least GLOBAL PRIVILEGES:'RELOAD, REPLICATION SLAVE, REPLICATION CLIENT' "
+                        "and SELECT PRIVILEGE on MySQL Database.But the SYNC USER grant query is: {}", out.str());
 }
 
 bool MaterializeMetadata::checkBinlogFileExists(const mysqlxx::PoolWithFailover::Entry & connection) const
@@ -218,14 +220,15 @@ bool MaterializeMetadata::checkBinlogFileExists(const mysqlxx::PoolWithFailover:
 
 void commitMetadata(Fn<void()> auto && function, const String & persistent_tmp_path, const String & persistent_path)
 {
+    auto db_disk = Context::getGlobalContextInstance()->getDatabaseDisk();
     try
     {
         function();
-        fs::rename(persistent_tmp_path, persistent_path);
+        db_disk->replaceFile(persistent_tmp_path, persistent_path);
     }
     catch (...)
     {
-        fs::remove(persistent_tmp_path);
+        db_disk->removeFileIfExists(persistent_tmp_path);
         throw;
     }
 }
@@ -239,44 +242,51 @@ void MaterializeMetadata::transaction(const MySQLReplication::Position & positio
     String persistent_tmp_path = persistent_path + ".tmp";
 
     {
-        WriteBufferFromFile out(persistent_tmp_path, DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_TRUNC | O_CREAT);
+        auto db_disk = Context::getGlobalContextInstance()->getDatabaseDisk();
+        auto out = db_disk->writeFile(persistent_tmp_path, DBMS_DEFAULT_BUFFER_SIZE);
 
         /// TSV format metadata file.
-        writeString("Version:\t" + toString(meta_version), out);
-        writeString("\nBinlog File:\t" + binlog_file, out);
-        writeString("\nExecuted GTID:\t" + executed_gtid_set, out);
-        writeString("\nBinlog Position:\t" + toString(binlog_position), out);
-        writeString("\nData Version:\t" + toString(data_version), out);
+        writeString("Version:\t" + toString(meta_version), *out);
+        writeString("\nBinlog File:\t" + binlog_file, *out);
+        writeString("\nExecuted GTID:\t" + executed_gtid_set, *out);
+        writeString("\nBinlog Position:\t" + toString(binlog_position), *out);
+        writeString("\nData Version:\t" + toString(data_version), *out);
 
-        out.next();
-        out.sync();
-        out.close();
+        out->next();
+        out->finalize();
+        out.reset();
     }
 
-    commitMetadata(std::move(fun), persistent_tmp_path, persistent_path);
+    commitMetadata(fun, persistent_tmp_path, persistent_path);
 }
 
 MaterializeMetadata::MaterializeMetadata(const String & path_, const Settings & settings_) : persistent_path(path_), settings(settings_)
 {
-    if (fs::exists(persistent_path))
-    {
-        ReadBufferFromFile in(persistent_path, DBMS_DEFAULT_BUFFER_SIZE);
-        assertString("Version:\t" + toString(meta_version), in);
-        assertString("\nBinlog File:\t", in);
-        readString(binlog_file, in);
-        assertString("\nExecuted GTID:\t", in);
-        readString(executed_gtid_set, in);
-        assertString("\nBinlog Position:\t", in);
-        readIntText(binlog_position, in);
-        assertString("\nData Version:\t", in);
-        readIntText(data_version, in);
+    auto db_disk = Context::getGlobalContextInstance()->getDatabaseDisk();
 
+    if (db_disk->existsFile(persistent_path))
+    {
+        ReadSettings read_settings = getReadSettings();
+        read_settings.local_fs_method = LocalFSReadMethod::read;
+        read_settings.local_fs_buffer_size = DBMS_DEFAULT_BUFFER_SIZE;
+        auto in = db_disk->readFile(persistent_path, read_settings);
+
+        assertString("Version:\t" + toString(meta_version), *in);
+        assertString("\nBinlog File:\t", *in);
+        readString(binlog_file, *in);
+        assertString("\nExecuted GTID:\t", *in);
+        readString(executed_gtid_set, *in);
+        assertString("\nBinlog Position:\t", *in);
+        readIntText(binlog_position, *in);
+        assertString("\nData Version:\t", *in);
+        readIntText(data_version, *in);
     }
 }
 
 void MaterializeMetadata::startReplication(
     mysqlxx::PoolWithFailover::Entry & connection, const String & database,
-    bool & opened_transaction, std::unordered_map<String, String> & need_dumping_tables)
+    bool & opened_transaction, std::unordered_map<String, String> & need_dumping_tables,
+    std::unordered_set<String> & materialized_tables_list)
 {
     checkSyncUserPriv(connection, settings);
 
@@ -297,7 +307,7 @@ void MaterializeMetadata::startReplication(
         connection->query("START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */;").execute();
 
         opened_transaction = true;
-        need_dumping_tables = fetchTablesCreateQuery(connection, database, fetchTablesInDB(connection, database, settings), settings);
+        need_dumping_tables = fetchTablesCreateQuery(connection, database, fetchTablesInDB(connection, database, settings), materialized_tables_list, settings);
         connection->query("UNLOCK TABLES;").execute();
     }
     catch (...)

@@ -1,8 +1,12 @@
 #pragma once
 
-#include <base/types.h>
 #include <memory>
+#include <Access/Common/SSLCertificateSubjects.h>
+#include <Common/SSHWrapper.h>
 
+#include <base/types.h>
+
+#include "config.h"
 
 namespace DB
 {
@@ -13,6 +17,9 @@ public:
     explicit Credentials() = default;
     explicit Credentials(const String & user_name_);
 
+    Credentials(const Credentials &) = default;
+    Credentials(Credentials &&) = default;
+
     virtual ~Credentials() = default;
 
     const String & getUserName() const;
@@ -21,7 +28,6 @@ public:
 protected:
     [[noreturn]] static void throwNotReady();
 
-protected:
     bool is_ready = false;
     String user_name;
 };
@@ -36,6 +42,17 @@ public:
     explicit AlwaysAllowCredentials(const String & user_name_);
 
     void setUserName(const String & user_name_);
+};
+
+class SSLCertificateCredentials
+    : public Credentials
+{
+public:
+    explicit SSLCertificateCredentials(const String & user_name_, SSLCertificateSubjects && subjects_);
+    const SSLCertificateSubjects & getSSLCertificateSubjects() const;
+
+private:
+    SSLCertificateSubjects certificate_subjects;
 };
 
 class BasicCredentials
@@ -75,5 +92,63 @@ class MySQLNative41Credentials : public CredentialsWithScramble
 {
     using CredentialsWithScramble::CredentialsWithScramble;
 };
+
+#if USE_SSH
+class SshCredentials : public Credentials
+{
+public:
+    SshCredentials(const String & user_name_, const String & signature_, const String & original_)
+        : Credentials(user_name_), signature(signature_), original(original_)
+    {
+        is_ready = true;
+    }
+
+    const String & getSignature() const
+    {
+        if (!isReady())
+        {
+            throwNotReady();
+        }
+        return signature;
+    }
+
+    const String & getOriginal() const
+    {
+        if (!isReady())
+        {
+            throwNotReady();
+        }
+        return original;
+    }
+
+private:
+    String signature;
+    String original;
+};
+
+/// Credentials used only for logging in with PTY.
+class SSHPTYCredentials : public Credentials
+{
+public:
+    explicit SSHPTYCredentials(const String & user_name_, const SSHKey & key_)
+        : Credentials(user_name_), key(key_)
+    {
+        is_ready = true;
+    }
+
+    const SSHKey & getKey() const
+    {
+        if (!isReady())
+        {
+            throwNotReady();
+        }
+        return key;
+    }
+
+private:
+    SSHKey key;
+};
+#endif
+
 
 }

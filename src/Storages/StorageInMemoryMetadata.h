@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Parsers/Access/ASTUserNameWithHost.h>
+#include <Parsers/ASTCreateQuery.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/ColumnDependency.h>
 #include <Storages/ColumnsDescription.h>
@@ -9,6 +11,7 @@
 #include <Storages/KeyDescription.h>
 #include <Storages/SelectQueryDescription.h>
 #include <Storages/TTLDescription.h>
+#include <Storages/MaterializedView/RefreshSchedule.h>
 
 #include <Common/MultiVersion.h>
 
@@ -47,15 +50,32 @@ struct StorageInMemoryMetadata
     ASTPtr settings_changes;
     /// SELECT QUERY. Supported for MaterializedView and View (have to support LiveView).
     SelectQueryDescription select;
+    /// Materialized view REFRESH parameters.
+    ASTPtr refresh;
+
+    /// DEFINER <user_name>. Allows to specify a definer of the table.
+    /// Supported for MaterializedView and View.
+    std::optional<String> definer;
+
+    /// SQL SECURITY <DEFINER | INVOKER | NONE>
+    /// Supported for MaterializedView and View.
+    std::optional<SQLSecurityType> sql_security_type;
 
     String comment;
+
+    /// Version of metadata. Managed properly by ReplicatedMergeTree only
+    /// (zero-initialization is important)
+    int32_t metadata_version = 0;
 
     StorageInMemoryMetadata() = default;
 
     StorageInMemoryMetadata(const StorageInMemoryMetadata & other);
     StorageInMemoryMetadata & operator=(const StorageInMemoryMetadata & other);
 
-    /// NOTE: Thread unsafe part. You should modify same StorageInMemoryMetadata
+    StorageInMemoryMetadata(StorageInMemoryMetadata && other) = default; /// NOLINT(hicpp-noexcept-move,performance-noexcept-move-constructor)
+    StorageInMemoryMetadata & operator=(StorageInMemoryMetadata && other) = default; /// NOLINT(hicpp-noexcept-move,performance-noexcept-move-constructor)
+
+    /// NOTE: Thread unsafe part. You should not modify same StorageInMemoryMetadata
     /// structure from different threads. It should be used as MultiVersion
     /// object. See example in IStorage.
 
@@ -74,15 +94,6 @@ struct StorageInMemoryMetadata
     /// Sets projections
     void setProjections(ProjectionsDescription projections_);
 
-    /// Set partition key for storage (methods below, are just wrappers for this struct).
-    void setPartitionKey(const KeyDescription & partition_key_);
-    /// Set sorting key for storage (methods below, are just wrappers for this struct).
-    void setSortingKey(const KeyDescription & sorting_key_);
-    /// Set primary key for storage (methods below, are just wrappers for this struct).
-    void setPrimaryKey(const KeyDescription & primary_key_);
-    /// Set sampling key for storage (methods below, are just wrappers for this struct).
-    void setSamplingKey(const KeyDescription & sampling_key_);
-
     /// Set common table TTLs
     void setTableTTLs(const TTLTableDescription & table_ttl_);
 
@@ -95,6 +106,23 @@ struct StorageInMemoryMetadata
 
     /// Set SELECT query for (Materialized)View
     void setSelectQuery(const SelectQueryDescription & select_);
+
+    /// Set refresh parameters for materialized view (REFRESH ... [DEPENDS ON ...] [SETTINGS ...]).
+    void setRefresh(ASTPtr refresh_);
+
+    /// Set version of metadata.
+    void setMetadataVersion(int32_t metadata_version_);
+    /// Get copy of current metadata with metadata_version_
+    StorageInMemoryMetadata withMetadataVersion(int32_t metadata_version_) const;
+
+    /// Sets SQL security for the storage.
+    void setSQLSecurity(const ASTSQLSecurity & sql_security);
+    UUID getDefinerID(ContextPtr context) const;
+
+    /// Returns a copy of the context with the correct user from SQL security options.
+    /// If the SQL security wasn't set, this is equivalent to `Context::createCopy(context)`.
+    /// The context from this function must be used every time whenever views execute any read/write operations or subqueries.
+    ContextMutablePtr getSQLSecurityOverriddenContext(ContextPtr context) const;
 
     /// Returns combined set of columns
     const ColumnsDescription & getColumns() const;
@@ -144,12 +172,23 @@ struct StorageInMemoryMetadata
     TTLDescriptions getGroupByTTLs() const;
     bool hasAnyGroupByTTL() const;
 
-    /// Returns columns, which will be needed to calculate dependencies (skip
-    /// indices, TTL expressions) if we update @updated_columns set of columns.
-    ColumnDependencies getColumnDependencies(const NameSet & updated_columns, bool include_ttl_target) const;
+    using HasDependencyCallback = std::function<bool(const String &, ColumnDependency::Kind)>;
+
+    /// Returns columns, which will be needed to calculate dependencies (skip indices, projections,
+    /// TTL expressions) if we update @updated_columns set of columns.
+    ColumnDependencies getColumnDependencies(
+        const NameSet & updated_columns,
+        bool include_ttl_target,
+        const HasDependencyCallback & has_dependency) const;
 
     /// Block with ordinary + materialized columns.
     Block getSampleBlock() const;
+
+    /// Block with ordinary + materialized columns + subcolumns.
+    Block getSampleBlockWithSubcolumns() const;
+
+    /// Block with ordinary + ephemeral.
+    Block getSampleBlockInsertable() const;
 
     /// Block with ordinary columns.
     Block getSampleBlockNonMaterialized() const;
@@ -159,13 +198,6 @@ struct StorageInMemoryMetadata
     /// Storage metadata.
     Block getSampleBlockWithVirtuals(const NamesAndTypesList & virtuals) const;
 
-
-    /// Block with ordinary + materialized + aliases + virtuals. Virtuals have
-    /// to be explicitly specified, because they are part of Storage type, not
-    /// Storage metadata. StorageID required only for more clear exception
-    /// message.
-    Block getSampleBlockForColumns(
-        const Names & column_names, const NamesAndTypesList & virtuals = {}, const StorageID & storage_id = StorageID::createEmpty()) const;
     /// Returns structure with partition key.
     const KeyDescription & getPartitionKey() const;
     /// Returns ASTExpressionList of partition key expression for storage or nullptr if there is none.
@@ -190,6 +222,9 @@ struct StorageInMemoryMetadata
     /// Returns columns names in sorting key specified by user in ORDER BY
     /// expression. For example: 'a', 'x * y', 'toStartOfMonth(date)', etc.
     Names getSortingKeyColumns() const;
+    /// Returns reverse indicators of columns in sorting key specified by user in ORDER BY
+    /// expression. For example: ('a' DESC, 'x * y', 'toStartOfMonth(date)' DESC) -> {1, 0, 1}.
+    std::vector<bool> getSortingKeyReverseFlags() const;
 
     /// Returns column names that need to be read for FINAL to work.
     Names getColumnsRequiredForFinal() const { return getColumnsRequiredForSortingKey(); }
@@ -228,9 +263,8 @@ struct StorageInMemoryMetadata
     const SelectQueryDescription & getSelectQuery() const;
     bool hasSelectQuery() const;
 
-    /// Verify that all the requested names are in the table and are set correctly:
-    /// list of names is not empty and the names do not repeat.
-    void check(const Names & column_names, const NamesAndTypesList & virtuals, const StorageID & storage_id) const;
+    /// Get version of metadata
+    int32_t getMetadataVersion() const { return metadata_version; }
 
     /// Check that all the requested names are in the table and have the correct types.
     void check(const NamesAndTypesList & columns) const;
@@ -246,5 +280,7 @@ struct StorageInMemoryMetadata
 
 using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 using MultiVersionStorageMetadataPtr = MultiVersion<StorageInMemoryMetadata>;
+
+String listOfColumns(const NamesAndTypesList & available_columns);
 
 }

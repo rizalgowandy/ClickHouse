@@ -1,6 +1,7 @@
 ---
-toc_priority: 68
-toc_title: "Хранение данных на внешних дисках"
+slug: /ru/operations/storing-data
+sidebar_position: 68
+sidebar_label: "Хранение данных на внешних дисках"
 ---
 
 # Хранение данных на внешних дисках {#external-disks}
@@ -19,7 +20,7 @@ toc_title: "Хранение данных на внешних дисках"
 
 Пример конфигурации:
 ``` xml
-<yandex>
+<clickhouse>
     <storage_configuration>
         <disks>
             <hdfs>
@@ -41,7 +42,7 @@ toc_title: "Хранение данных на внешних дисках"
     <merge_tree>
         <min_bytes_for_wide_part>0</min_bytes_for_wide_part>
     </merge_tree>
-</yandex>
+</clickhouse>
 ```
 
 Обязательные параметры:
@@ -81,7 +82,7 @@ toc_title: "Хранение данных на внешних дисках"
 
 -   `type` — `encrypted`. Иначе зашифрованный диск создан не будет.
 -   `disk` — тип диска для хранения данных.
--   `key` — ключ для шифрования и расшифровки. Тип: [Uint64](../sql-reference/data-types/int-uint.md). Вы можете использовать параметр `key_hex` для шифрования в шестнадцатеричной форме.
+-   `key` — ключ для шифрования и расшифровки. Тип: [UInt64](../sql-reference/data-types/int-uint.md). Вы можете использовать параметр `key_hex` для шифрования в шестнадцатеричной форме.
     Вы можете указать несколько ключей, используя атрибут `id` (смотрите пример выше).
 
 Необязательные параметры:
@@ -93,7 +94,7 @@ toc_title: "Хранение данных на внешних дисках"
 Пример конфигурации:
 
 ``` xml
-<yandex>
+<clickhouse>
     <storage_configuration>
         <disks>
             <disk_s3>
@@ -110,7 +111,7 @@ toc_title: "Хранение данных на внешних дисках"
             </disk_s3_encrypted>
         </disks>
     </storage_configuration>
-</yandex>
+</clickhouse>
 ```
 
 ## Хранение данных на веб-сервере {#storing-data-on-webserver}
@@ -124,7 +125,7 @@ toc_title: "Хранение данных на внешних дисках"
 Готовый тестовый пример. Добавьте эту конфигурацию в config:
 
 ``` xml
-<yandex>
+<clickhouse>
     <storage_configuration>
         <disks>
             <web>
@@ -142,7 +143,7 @@ toc_title: "Хранение данных на внешних дисках"
             </web>
         </policies>
     </storage_configuration>
-</yandex>
+</clickhouse>
 ```
 
 А затем выполните этот запрос:

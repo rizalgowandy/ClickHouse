@@ -2,12 +2,12 @@
 
 #include <base/types.h>
 
-#include <memory>
 #include <vector>
 #include <Core/Field.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/ColumnsDescription.h>
+#include <Common/NamePrompter.h>
 
 namespace DB
 {
@@ -61,10 +61,12 @@ struct IndexDescription
 };
 
 /// All secondary indices in storage
-struct IndicesDescription : public std::vector<IndexDescription>
+struct IndicesDescription : public std::vector<IndexDescription>, IHints<>
 {
     /// Index with name exists
     bool has(const String & name) const;
+    /// Index with type exists
+    bool hasType(const String & type) const;
     /// Convert description to string
     String toString() const;
     /// Parse description from string
@@ -72,6 +74,8 @@ struct IndicesDescription : public std::vector<IndexDescription>
 
     /// Return common expression for all stored indices
     ExpressionActionsPtr getSingleExpressionForIndices(const ColumnsDescription & columns, ContextPtr context) const;
+
+    Names getAllRegisteredNames() const override;
 };
 
 }

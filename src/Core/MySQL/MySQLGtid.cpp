@@ -1,6 +1,10 @@
 #include "MySQLGtid.h"
-#include <boost/algorithm/string.hpp>
+
+#include <Core/UUID.h>
 #include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
+
+#include <boost/algorithm/string.hpp>
 
 
 namespace DB
@@ -21,12 +25,10 @@ void GTIDSet::tryMerge(size_t i)
     intervals.erase(intervals.begin() + i + 1, intervals.begin() + i + 1 + 1);
 }
 
-void GTIDSets::parse(const String gtid_format)
+void GTIDSets::parse(String gtid_format)
 {
     if (gtid_format.empty())
-    {
         return;
-    }
 
     std::vector<String> gtid_sets;
     boost::split(gtid_sets, gtid_format, [](char c) { return c == ','; });
@@ -41,7 +43,7 @@ void GTIDSets::parse(const String gtid_format)
         GTIDSet set;
         set.uuid = DB::parse<UUID>(server_ids[0]);
 
-        for (size_t k = 1; k < server_ids.size(); k++)
+        for (size_t k = 1; k < server_ids.size(); ++k)
         {
             std::vector<String> inters;
             boost::split(inters, server_ids[k], [](char c) { return c == '-'; });
@@ -60,7 +62,7 @@ void GTIDSets::parse(const String gtid_format)
                     break;
                 }
                 default:
-                    throw Exception("GTIDParse: Invalid GTID interval: " + server_ids[k], ErrorCodes::LOGICAL_ERROR);
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "GTIDParse: Invalid GTID interval: {}", server_ids[k]);
             }
             set.intervals.emplace_back(val);
         }
@@ -74,16 +76,15 @@ void GTIDSets::update(const GTID & other)
     {
         if (set.uuid == other.uuid)
         {
-            for (auto i = 0U; i < set.intervals.size(); i++)
+            for (auto i = 0U; i < set.intervals.size(); ++i)
             {
                 auto & current = set.intervals[i];
 
                 /// Already Contained.
                 if (other.seq_no >= current.start && other.seq_no < current.end)
                 {
-                    throw Exception(
-                        "GTIDSets updates other: " + std::to_string(other.seq_no) + " invalid successor to " + std::to_string(current.end),
-                        ErrorCodes::LOGICAL_ERROR);
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "GTIDSets updates other: {} invalid successor to {}",
+                        std::to_string(other.seq_no), std::to_string(current.end));
                 }
 
                 /// Try to shrink Sequence interval.
@@ -134,7 +135,7 @@ String GTIDSets::toString() const
 {
     WriteBufferFromOwnString buffer;
 
-    for (size_t i = 0; i < sets.size(); i++)
+    for (size_t i = 0; i < sets.size(); ++i)
     {
         GTIDSet set = sets[i];
         writeUUIDText(set.uuid, buffer);
@@ -175,8 +176,8 @@ String GTIDSets::toPayload() const
     for (const auto & set : sets)
     {
         // MySQL UUID is big-endian.
-        writeBinaryBigEndian(set.uuid.toUnderType().items[0], buffer);
-        writeBinaryBigEndian(set.uuid.toUnderType().items[1], buffer);
+        writeBinaryBigEndian(UUIDHelpers::getHighBytes(set.uuid), buffer);
+        writeBinaryBigEndian(UUIDHelpers::getLowBytes(set.uuid), buffer);
 
         UInt64 intervals_size = set.intervals.size();
         buffer.write(reinterpret_cast<const char *>(&intervals_size), 8);
@@ -187,6 +188,50 @@ String GTIDSets::toPayload() const
         }
     }
     return buffer.str();
+}
+
+bool GTIDSet::contains(const GTIDSet & gtid_set) const
+{
+    //we contain the other set if each of its intervals are contained in any of our intervals.
+    //use the fact that intervals are sorted to make this linear instead of quadratic.
+    if (uuid != gtid_set.uuid) { return false; }
+
+    auto mine = intervals.begin();
+    auto other = gtid_set.intervals.begin();
+    auto my_end = intervals.end();
+    auto other_end = gtid_set.intervals.end();
+    while (mine != my_end && other != other_end)
+    {
+        bool mine_contains_other = mine->start <= other->start && mine->end >= other->end;
+        if (mine_contains_other)
+        {
+            ++other;
+        }
+        else
+        {
+            ++mine;
+        }
+    }
+
+    return other == other_end; //if we've iterated through all intervals in the argument, all its intervals are contained in this
+}
+
+bool GTIDSets::contains(const GTIDSet & gtid_set) const
+{
+    for (const auto & my_gtid_set : sets)
+    {
+        if (my_gtid_set.contains(gtid_set)) { return true; }
+    }
+    return false;
+}
+
+bool GTIDSets::contains(const GTIDSets & gtid_sets) const
+{
+    for (const auto & gtid_set : gtid_sets.sets)
+    {
+        if (!this->contains(gtid_set)) { return false; }
+    }
+    return true;
 }
 
 }

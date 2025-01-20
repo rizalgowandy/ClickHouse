@@ -1,231 +1,285 @@
 #!/usr/bin/env python3
-import subprocess
-import logging
-from report import create_test_html_report
-from s3_helper import S3Helper
+import argparse
 import json
+import logging
 import os
-from pr_info import PRInfo
+import sys
+import time
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 from github import Github
-import shutil
-from get_robot_token import get_best_robot_token, get_parameter_from_ssm
 
-NAME = "Push to Dockerhub (actions)"
+from clickhouse_helper import ClickHouseHelper, prepare_tests_results_for_clickhouse
+from commit_status_helper import format_description, get_commit, post_commit_status
+from docker_images_helper import DockerImageData, docker_login, get_images_oredered_list
+from env_helper import GITHUB_RUN_URL, RUNNER_TEMP
+from get_robot_token import get_best_robot_token
+from pr_info import PRInfo
+from report import FAILURE, SUCCESS, StatusType, TestResult, TestResults
+from s3_helper import S3Helper
+from stopwatch import Stopwatch
+from tee_popen import TeePopen
+from upload_result_helper import upload_results
 
-def get_changed_docker_images(pr_info, repo_path, image_file_path):
-    images_dict = {}
-    path_to_images_file = os.path.join(repo_path, image_file_path)
-    if os.path.exists(path_to_images_file):
-        with open(path_to_images_file, 'r') as dict_file:
-            images_dict = json.load(dict_file)
-    else:
-        logging.info("Image file %s doesnt exists in repo %s", image_file_path, repo_path)
+TEMP_PATH = Path(RUNNER_TEMP) / "docker_images_check"
+TEMP_PATH.mkdir(parents=True, exist_ok=True)
 
-    dockerhub_repo_name = 'yandex'
-    if not images_dict:
-        return [], dockerhub_repo_name
 
-    files_changed = pr_info.changed_files
+def build_and_push_one_image(
+    image: DockerImageData,
+    version_string: str,
+    additional_cache: List[str],
+    push: bool,
+    from_tag: Optional[str] = None,
+) -> Tuple[bool, Path]:
+    logging.info(
+        "Building docker image %s with version %s from path %s",
+        image.repo,
+        version_string,
+        image.path,
+    )
+    build_log = (
+        Path(TEMP_PATH)
+        / f"build_and_push_log_{image.repo.replace('/', '_')}_{version_string}.log"
+    )
+    push_arg = ""
+    if push:
+        push_arg = "--push "
 
-    logging.info("Changed files for PR %s @ %s: %s", pr_info.number, pr_info.sha, str(files_changed))
+    from_tag_arg = ""
+    if from_tag:
+        from_tag_arg = f"--build-arg FROM_TAG={from_tag} "
 
-    changed_images = []
+    cache_from = (
+        f"--cache-from type=registry,ref={image.repo}:{version_string} "
+        f"--cache-from type=registry,ref={image.repo}:latest"
+    )
+    for tag in additional_cache:
+        assert tag
+        cache_from = f"{cache_from} --cache-from type=registry,ref={image.repo}:{tag}"
 
-    for dockerfile_dir, image_description in images_dict.items():
-        if image_description['name'].startswith('clickhouse/'):
-            dockerhub_repo_name = 'clickhouse'
+    cmd = (
+        "docker buildx build --builder default "
+        f"--label build-url={GITHUB_RUN_URL} "
+        f"{from_tag_arg}"
+        # A hack to invalidate cache, grep for it in docker/ dir
+        f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
+        f"--tag {image.repo}:{version_string} "
+        f"{cache_from} "
+        f"--cache-to type=inline,mode=max "
+        f"{push_arg}"
+        f"--progress plain {image.path}"
+    )
+    logging.info("Docker command to run: %s", cmd)
+    with TeePopen(cmd, build_log) as proc:
+        retcode = proc.wait()
 
-        for f in files_changed:
-            if f.startswith(dockerfile_dir):
-                logging.info(
-                    "Found changed file '%s' which affects docker image '%s' with path '%s'",
-                    f, image_description['name'], dockerfile_dir)
-                changed_images.append(dockerfile_dir)
-                break
+    if retcode != 0:
+        return False, build_log
 
-    # The order is important: dependents should go later than bases, so that
-    # they are built with updated base versions.
-    index = 0
-    while index < len(changed_images):
-        image = changed_images[index]
-        for dependent in images_dict[image]['dependent']:
-            logging.info(
-                "Marking docker image '%s' as changed because it depends on changed docker image '%s'",
-                dependent, image)
-            changed_images.append(dependent)
-        index += 1
-        if index > 100:
-            # Sanity check to prevent infinite loop.
-            raise "Too many changed docker images, this is a bug." + str(changed_images)
+    logging.info("Processing of %s successfully finished", image.repo)
+    return True, build_log
 
-    # If a dependent image was already in the list because its own files
-    # changed, but then it was added as a dependent of a changed base, we
-    # must remove the earlier entry so that it doesn't go earlier than its
-    # base. This way, the dependent will be rebuilt later than the base, and
-    # will correctly use the updated version of the base.
-    seen = set()
-    no_dups_reversed = []
-    for x in reversed(changed_images):
-        if x not in seen:
-            seen.add(x)
-            no_dups_reversed.append(x)
 
-    result = [(x, images_dict[x]['name']) for x in reversed(no_dups_reversed)]
-    logging.info("Changed docker images for PR %s @ %s: '%s'", pr_info.number, pr_info.sha, result)
-    return result, dockerhub_repo_name
-
-def build_and_push_one_image(path_to_dockerfile_folder, image_name, version_string):
-    logging.info("Building docker image %s with version %s from path %s", image_name, version_string, path_to_dockerfile_folder)
-    build_log = None
-    push_log = None
-    with open('build_log_' + str(image_name).replace('/', '_') + "_" + version_string, 'w') as pl:
-        cmd = "docker build --network=host -t {im}:{ver} {path}".format(im=image_name, ver=version_string, path=path_to_dockerfile_folder)
-        retcode = subprocess.Popen(cmd, shell=True, stderr=pl, stdout=pl).wait()
-        build_log = str(pl.name)
-        if retcode != 0:
-            return False, build_log, None
-
-    with open('tag_log_' + str(image_name).replace('/', '_') + "_" + version_string, 'w') as pl:
-        cmd = "docker build --network=host -t {im} {path}".format(im=image_name, path=path_to_dockerfile_folder)
-        retcode = subprocess.Popen(cmd, shell=True, stderr=pl, stdout=pl).wait()
-        build_log = str(pl.name)
-        if retcode != 0:
-            return False, build_log, None
-
-    logging.info("Pushing image %s to dockerhub", image_name)
-
-    with open('push_log_' + str(image_name).replace('/', '_') + "_" + version_string, 'w') as pl:
-        cmd = "docker push {im}:{ver}".format(im=image_name, ver=version_string)
-        retcode = subprocess.Popen(cmd, shell=True, stderr=pl, stdout=pl).wait()
-        push_log = str(pl.name)
-        if retcode != 0:
-            return False, build_log, push_log
-
-    logging.info("Processing of %s successfully finished", image_name)
-    return True, build_log, push_log
-
-def process_single_image(versions, path_to_dockerfile_folder, image_name):
-    logging.info("Image will be pushed with versions %s", ', '.join(versions))
-    result = []
+def process_single_image(
+    image: DockerImageData,
+    versions: List[str],
+    additional_cache: List[str],
+    push: bool,
+    from_tag: Optional[str] = None,
+) -> TestResults:
+    logging.info("Image will be pushed with versions %s", ", ".join(versions))
+    results = []  # type: TestResults
     for ver in versions:
-        for i in range(5):
-            success, build_log, push_log = build_and_push_one_image(path_to_dockerfile_folder, image_name, ver)
+        stopwatch = Stopwatch()
+        for i in range(2):
+            success, build_log = build_and_push_one_image(
+                image, ver, additional_cache, push, from_tag
+            )
             if success:
-                result.append((image_name + ":" + ver, build_log, push_log, 'OK'))
+                results.append(
+                    TestResult(
+                        image.repo + ":" + ver,
+                        "OK",
+                        stopwatch.duration_seconds,
+                        [build_log],
+                    )
+                )
                 break
-            logging.info("Got error will retry %s time and sleep for %s seconds", i, i * 5)
+            logging.info(
+                "Got error will retry %s time and sleep for %s seconds", i, i * 5
+            )
             time.sleep(i * 5)
         else:
-            result.append((image_name + ":" + ver, build_log, push_log, 'FAIL'))
+            results.append(
+                TestResult(
+                    image.repo + ":" + ver,
+                    "FAIL",
+                    stopwatch.duration_seconds,
+                    [build_log],
+                )
+            )
 
     logging.info("Processing finished")
-    return result
+    image.built = True
+    return results
 
 
-def process_test_results(s3_client, test_results, s3_path_prefix):
-    overall_status = 'success'
-    processed_test_results = []
-    for image, build_log, push_log, status in test_results:
-        if status != 'OK':
-            overall_status = 'failure'
-        url_part = ''
-        if build_log is not None and os.path.exists(build_log):
-            build_url = s3_client.upload_test_report_to_s3(
-                build_log,
-                s3_path_prefix + "/" + os.path.basename(build_log))
-            url_part += '<a href="{}">build_log</a>'.format(build_url)
-        if push_log is not None and os.path.exists(push_log):
-            push_url = s3_client.upload_test_report_to_s3(
-                push_log,
-                s3_path_prefix + "/" + os.path.basename(push_log))
-            if url_part:
-                url_part += ', '
-            url_part += '<a href="{}">push_log</a>'.format(push_url)
-        if url_part:
-            test_name = image + ' (' + url_part + ')'
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Program to build changed or given docker images with all "
+        "dependant images. Example for local running: "
+        "python docker_images_check.py --no-push-images --no-reports "
+        "--image-path docker/packager/binary",
+    )
+
+    parser.add_argument("--suffix", type=str, required=True, help="arch suffix")
+    parser.add_argument(
+        "--missing-images",
+        type=str,
+        required=True,
+        help="json string or json file with images to build {IMAGE: TAG} or type all to build all",
+    )
+    parser.add_argument(
+        "--image-tags",
+        type=str,
+        required=True,
+        help="json string or json file with all images and their tags {IMAGE: TAG}",
+    )
+    parser.add_argument("--reports", default=True, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--no-reports",
+        action="store_false",
+        dest="reports",
+        default=argparse.SUPPRESS,
+        help="don't push reports to S3 and github",
+    )
+    parser.add_argument("--push", default=True, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--no-push-images",
+        action="store_false",
+        dest="push",
+        default=argparse.SUPPRESS,
+        help="don't push images to docker hub",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    stopwatch = Stopwatch()
+
+    args = parse_args()
+
+    NAME = f"Push to Dockerhub {args.suffix}"
+
+    if args.push:
+        logging.info("login to docker hub")
+        docker_login()
+
+    test_results = []  # type: TestResults
+    additional_cache = []  # type: List[str]
+    # FIXME: add all tags taht we need. latest on master!
+    # if pr_info.release_pr:
+    #     logging.info("Use %s as additional cache tag", pr_info.release_pr)
+    #     additional_cache.append(str(pr_info.release_pr))
+    # if pr_info.merged_pr:
+    #     logging.info("Use %s as additional cache tag", pr_info.merged_pr)
+    #     additional_cache.append(str(pr_info.merged_pr))
+
+    ok_cnt = 0
+    status = SUCCESS  # type: StatusType
+
+    if os.path.isfile(args.image_tags):
+        with open(args.image_tags, "r", encoding="utf-8") as jfd:
+            image_tags = json.load(jfd)
+    else:
+        image_tags = json.loads(args.image_tags)
+
+    if args.missing_images == "all":
+        missing_images = image_tags
+    elif os.path.isfile(args.missing_images):
+        with open(args.missing_images, "r", encoding="utf-8") as jfd:
+            missing_images = json.load(jfd)
+    else:
+        missing_images = json.loads(args.missing_images)
+
+    images_build_list = get_images_oredered_list()
+
+    for image in images_build_list:
+        if image.repo not in missing_images:
+            continue
+        logging.info("Start building image: %s", image)
+
+        image_versions = (
+            [image_tags[image.repo]]
+            if not args.suffix
+            else [f"{image_tags[image.repo]}-{args.suffix}"]
+        )
+        parent_version = (
+            None
+            if not image.parent
+            else (
+                image_tags[image.parent]
+                if not args.suffix
+                else f"{image_tags[image.parent]}-{args.suffix}"
+            )
+        )
+
+        res = process_single_image(
+            image,
+            image_versions,
+            additional_cache,
+            args.push,
+            from_tag=parent_version,
+        )
+        test_results += res
+        if all(x.status == "OK" for x in res):
+            ok_cnt += 1
         else:
-            test_name = image
-        processed_test_results.append((test_name, status))
-    return overall_status, processed_test_results
+            status = FAILURE
+            break  # No need to continue with next images
 
-def upload_results(s3_client, pr_number, commit_sha, test_results):
-    s3_path_prefix = f"{pr_number}/{commit_sha}/" + NAME.lower().replace(' ', '_')
+    description = format_description(
+        f"Images build done. built {ok_cnt} out of {len(missing_images)} images."
+    )
 
-    branch_url = "https://github.com/ClickHouse/ClickHouse/commits/master"
-    branch_name = "master"
-    if pr_number != 0:
-        branch_name = "PR #{}".format(pr_number)
-        branch_url = "https://github.com/ClickHouse/ClickHouse/pull/" + str(pr_number)
-    commit_url = f"https://github.com/ClickHouse/ClickHouse/commit/{commit_sha}"
+    s3_helper = S3Helper()
 
-    task_url = f"https://github.com/ClickHouse/ClickHouse/actions/runs/{os.getenv('GITHUB_RUN_ID')}"
+    pr_info = PRInfo()
+    url = upload_results(
+        s3_helper, pr_info.number, pr_info.sha, pr_info.head_ref, test_results, [], NAME
+    )
 
-    html_report = create_test_html_report(NAME, test_results, "https://hub.docker.com/u/clickhouse", task_url, branch_url, branch_name, commit_url)
-    with open('report.html', 'w') as f:
-        f.write(html_report)
+    print(f"::notice ::Report url: {url}")
 
-    url = s3_client.upload_test_report_to_s3('report.html', s3_path_prefix + ".html")
-    logging.info("Search result in url %s", url)
-    return url
+    if not args.reports:
+        return
 
-def get_commit(gh, commit_sha):
-    repo = gh.get_repo(os.getenv("GITHUB_REPOSITORY", "ClickHouse/ClickHouse"))
-    commit = repo.get_commit(commit_sha)
-    return commit
+    gh = Github(get_best_robot_token(), per_page=100)
+    commit = get_commit(gh, pr_info.sha)
+    post_commit_status(
+        commit, status, url, description, NAME, pr_info, dump_to_file=True
+    )
+
+    prepared_events = prepare_tests_results_for_clickhouse(
+        pr_info,
+        test_results,
+        status,
+        stopwatch.duration_seconds,
+        stopwatch.start_time_str,
+        url,
+        NAME,
+    )
+    ch_helper = ClickHouseHelper()
+    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+
+    if status == FAILURE:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    repo_path = os.getenv("GITHUB_WORKSPACE", os.path.abspath("../../"))
-    temp_path = os.path.join(os.getenv("RUNNER_TEMP", os.path.abspath("./temp")), 'docker_images_check')
-    dockerhub_password = get_parameter_from_ssm('dockerhub_robot_password')
-
-    if os.path.exists(temp_path):
-        shutil.rmtree(temp_path)
-
-    if not os.path.exists(temp_path):
-        os.makedirs(temp_path)
-
-    with open(os.getenv('GITHUB_EVENT_PATH'), 'r') as event_file:
-        event = json.load(event_file)
-
-    pr_info = PRInfo(event, False, True)
-    changed_images, dockerhub_repo_name = get_changed_docker_images(pr_info, repo_path, "docker/images.json")
-    logging.info("Has changed images %s", ', '.join([str(image[0]) for image in changed_images]))
-    pr_commit_version = str(pr_info.number) + '-' + pr_info.sha
-
-    versions = [str(pr_info.number), pr_commit_version]
-
-    subprocess.check_output("docker login --username 'robotclickhouse' --password '{}'".format(dockerhub_password), shell=True)
-
-    result_images = {}
-    images_processing_result = []
-    for rel_path, image_name in changed_images:
-        full_path = os.path.join(repo_path, rel_path)
-        images_processing_result += process_single_image(versions, full_path, image_name)
-        result_images[image_name] = pr_commit_version
-
-    if len(changed_images):
-        description = "Updated " + ','.join([im[1] for im in changed_images])
-    else:
-        description = "Nothing to update"
-
-
-    if len(description) >= 140:
-        description = description[:136] + "..."
-
-    s3_helper = S3Helper('https://s3.amazonaws.com')
-
-    s3_path_prefix = str(pr_info.number) + "/" + pr_info.sha + "/" + NAME.lower().replace(' ', '_')
-    status, test_results = process_test_results(s3_helper, images_processing_result, s3_path_prefix)
-
-    url = upload_results(s3_helper, pr_info.number, pr_info.sha, test_results)
-
-    gh = Github(get_best_robot_token())
-    commit = get_commit(gh, pr_info.sha)
-    commit.create_status(context=NAME, description=description, state=status, target_url=url)
-
-    with open(os.path.join(temp_path, 'changed_images.json'), 'w') as images_file:
-        json.dump(result_images, images_file)
-
-    print("::notice ::Report url: {}".format(url))
-    print("::set-output name=url_output::\"{}\"".format(url))
+    main()
